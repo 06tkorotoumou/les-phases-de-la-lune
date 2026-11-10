@@ -178,6 +178,17 @@
   <div class="panel-header">Options Avancées</div>
   <div class="content">
     <div class="control-group">
+      <label>Caméra libre (aucun mouvement automatique)</label>
+      <div class="hint">Glisser : tourner · Molette / pincer : zoom · Clic droit / deux doigts : déplacer.</div>
+    </div>
+
+    <div class="control-group">
+      <label>Mode éclipse (précession des nœuds)</label>
+      <button id="btnAnimateEclipse">Mode Éclipse</button>
+      <div id="eclipseCinematicStatus" class="hint" style="display:none;">—</div>
+    </div>
+
+    <div class="control-group">
       <button id="btnTextures">Charger les textures HD</button>
     </div>
 
@@ -201,13 +212,6 @@
         <label>Décalage (jours) <span id="timeOffsetVal" class="value-display">0</span></label>
         <input type="range" id="timeOffset" min="-15" max="15" value="0" step="0.1" style="width:100%;">
       </div>
-    </div>
-
-    <div class="control-group">
-      <label>Cinématique d'éclipse</label>
-      <button id="btnAnimateEclipse">▶ Animer Éclipse</button>
-      <button id="btnResetView" style="display:none; margin-top:6px;">↺ Retour vue normale</button>
-      <div id="eclipseCinematicStatus" class="hint" style="display:none;">—</div>
     </div>
 
     <div class="control-group">
@@ -710,7 +714,9 @@ scene.add(new THREE.Points(
 ));
 
 const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 10000);
-camera.position.set(SCENE.EARTH_ORBIT - 3, 4, 8);
+// Vue large d'orrery : le Soleil au centre, l'orbite terrestre entière et la
+// Terre visible. La caméra ne bouge plus automatiquement ensuite.
+camera.position.set(20, 15, 24);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -719,8 +725,25 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(SCENE.EARTH_ORBIT, 0, 0);
-controls.enableDamping = true;
+controls.target.set(0, 0, 0);
+// Pas d'inertie : la caméra s'arrête dès que l'utilisateur relâche, pour un
+// contrôle réellement total.
+controls.enableDamping = false;
+// Contrôle manuel total : rotation (clic gauche), zoom (molette / pincement),
+// déplacement (clic droit / deux doigts). Aucun mouvement automatique.
+controls.enableRotate = true;
+controls.enableZoom = true;
+controls.enablePan = true;
+controls.screenSpacePanning = true;
+controls.mouseButtons = {
+  LEFT: THREE.MOUSE.ROTATE,
+  MIDDLE: THREE.MOUSE.DOLLY,
+  RIGHT: THREE.MOUSE.PAN
+};
+controls.touches = {
+  ONE: THREE.TOUCH.ROTATE,
+  TWO: THREE.TOUCH.DOLLY_PAN
+};
 
 // Lumières
 const ambientLight = new THREE.AmbientLight(0x444455, 1.2);
@@ -815,7 +838,6 @@ moonOrbitTilt.add(orbitLine);
 // 2bis. ORBITE ANNUELLE DE LA TERRE + EFFETS D'ÉCLIPSE
 // ==========================================
 const UP = new THREE.Vector3(0, 1, 0);
-const CAMERA_START_OFFSET = new THREE.Vector3(-3, 4, 8);
 const EARTH_ORBIT_A = SCENE.EARTH_ORBIT;
 const EARTH_ORBIT_E = 0.0167;
 const EARTH_PERIHELION_DEG = 102.937;
@@ -880,30 +902,25 @@ const appState = {
   useRealTime: false,
   timeOffset: 0,
   simEpochMs: ASTRONOMY.NEW_MOON_EPOCH_MS,
-  sky: null
+  sky: null,
+  visualNodeDeg: 0,
+  visualBetaDeg: 0
 };
 
-const cinematic = {
+// Mode éclipse : on ne change JAMAIS l'inclinaison de 5,145°. On anime la
+// précession du plan orbital (rotation du nœud autour du pôle écliptique)
+// jusqu'à ce que le nœud coïncide avec la syzygie.
+const eclipseMode = {
   active: false,
-  phase: 'idle',
-  peakMs: 0,
-  startMs: 0,
-  endMs: 0,
+  phase: 'idle', // 'precession' | 'hold'
   dateMs: 0,
-  phaseElapsed: 0,
-  cameraElapsed: 0,
-  cameraTweenDuration: 2.5,
-  approachDuration: 5,
-  holdDuration: 3,
-  departDuration: 5,
-  normalCameraOffset: new THREE.Vector3(),
-  normalTargetOffset: new THREE.Vector3(),
-  effectStrength: 0,
-  eclipse: null
+  eclipse: null,
+  targetNodeDeg: 0,
+  nodeDeg: 0,
+  progress: 0,
+  duration: 5,
+  effectStrength: 0
 };
-let cameraInitialized = false;
-const previousEarthPosition = new THREE.Vector3(SCENE.EARTH_ORBIT, 0, 0);
-const earthDelta = new THREE.Vector3();
 const earthPositionVector = new THREE.Vector3();
 
 const ui = {
@@ -938,7 +955,6 @@ const ui = {
   skyDate: document.getElementById('skyDate'),
   season: document.getElementById('season'),
   btnAnimateEclipse: document.getElementById('btnAnimateEclipse'),
-  btnResetView: document.getElementById('btnResetView'),
   eclipseCinematicStatus: document.getElementById('eclipseCinematicStatus'),
   hud: document.getElementById('hud')
 };
@@ -1093,7 +1109,7 @@ const zenithA = new THREE.Vector3();
 const zenithB = new THREE.Vector3();
 
 function currentDateMs() {
-  if (cinematic.active) return cinematic.dateMs;
+  if (eclipseMode.active) return eclipseMode.dateMs;
   return appState.useRealTime
     ? Date.now() + appState.timeOffset * DAY_MS
     : appState.simEpochMs + appState.timeDays * DAY_MS;
@@ -1116,20 +1132,30 @@ function updateScene() {
 
   // La Lune est placée dans le repère écliptique absolu (le Soleil est à
   // l'origine), ce qui reste correct quand la Terre se déplace sur son orbite.
+  // En mode éclipse, seule la longitude du NŒUD change : l'inclinaison de
+  // 5,145° reste strictement constante, et la latitude visuelle est recalculée
+  // par rapport à ce nœud en précession.
+  const visualNodeDeg = eclipseMode.active ? eclipseMode.nodeDeg : sky.moon.nodeDeg;
+  const visualBetaDeg = eclipseMode.active
+    ? ASTRONOMY.MOON_INCLINATION_DEG * sinDeg(sky.moon.lambdaDeg - visualNodeDeg)
+    : sky.moon.betaDeg;
+  appState.visualNodeDeg = normalizeDeg(visualNodeDeg);
+  appState.visualBetaDeg = visualBetaDeg;
+
   const moonOrbitRadius = SCENE.MOON_ORBIT * (sky.moon.distanceKm / ASTRONOMY.MOON_MEAN_DISTANCE_KM);
-  const moonAbsoluteDirection = eclipticUnit(sky.moon.lambdaDeg, sky.moon.betaDeg);
+  const moonAbsoluteDirection = eclipticUnit(sky.moon.lambdaDeg, visualBetaDeg);
   moon.position.set(
     moonAbsoluteDirection.x * moonOrbitRadius,
     moonAbsoluteDirection.y * moonOrbitRadius,
     moonAbsoluteDirection.z * moonOrbitRadius
   );
 
-  // Ligne des nœuds dans le plan écliptique absolu.
-  moonOrbitPlane.rotation.y = normalizeDeg(sky.moon.nodeDeg) * DEG2RAD;
+  // Ligne des nœuds dans le plan écliptique absolu (réelle ou en précession).
+  moonOrbitPlane.rotation.y = normalizeDeg(visualNodeDeg) * DEG2RAD;
 
   // Orbite annuelle de la Terre : la longitude héliocentrique est l'opposé de
   // la longitude géocentrique du Soleil ; la distance à l'échelle de la scène
-  // suit la distance réelle en UA.
+  // suit la distance réelle en UA. La caméra, elle, reste 100 % manuelle.
   const earthHeliocentricLongitude = normalizeDeg(sky.sun.lambdaDeg + 180);
   const earthOrbitRadius = SCENE.EARTH_ORBIT * sky.sun.distanceAU;
   const earthDirection = eclipticUnit(earthHeliocentricLongitude, 0);
@@ -1138,21 +1164,8 @@ function updateScene() {
     0,
     earthDirection.z * earthOrbitRadius
   );
-  earthDelta.copy(earthPositionVector).sub(previousEarthPosition);
   earthGroup.position.copy(earthPositionVector);
   moonOrbitGroup.position.copy(earthPositionVector);
-
-  // La caméra suit la Terre sur son orbite (sauf pendant la cinématique, où
-  // la vue d'alignement est gérée séparément).
-  if (!cameraInitialized) {
-    camera.position.copy(earthPositionVector).add(CAMERA_START_OFFSET);
-    controls.target.copy(earthPositionVector);
-    cameraInitialized = true;
-  } else if (!cinematic.active) {
-    camera.position.add(earthDelta);
-    controls.target.add(earthDelta);
-  }
-  previousEarthPosition.copy(earthPositionVector);
 
   // Rotation terrestre : jour sidéral réel (0,99727 jour).
   earth.rotation.y = (TAU / 0.99726968) * positiveMod(sky.days, 0.99726968);
@@ -1179,16 +1192,13 @@ function updateScene() {
   drawMoonPhase(ui.canvasA, ui.labelA, ui.statusA, sky, appState.latitudeA, aboveHorizonA, isDayA);
   drawMoonPhase(ui.canvasB, ui.labelB, ui.statusB, sky, -appState.latitudeA, aboveHorizonB, isDayB);
   updateHud(sky, dateMs);
+
+  if (eclipseMode.active) updateEclipseVisuals();
 }
 
 // ==========================================
-// 5bis. CINÉMATIQUE D'ÉCLIPSE (NŒUD ORBITAL)
+// 5bis. MODE ÉCLIPSE — PRÉCESSION DES NŒUDS
 // ==========================================
-function easeInOut(t) {
-  const clamped = clamp(t, 0, 1);
-  return clamped * clamped * (3 - 2 * clamped);
-}
-
 function setMoonEclipseTint(strength) {
   moonMaterial.color.copy(MOON_BASE_COLOR).lerp(MOON_ECLIPSE_COLOR, strength);
   moonMaterial.emissive.copy(MOON_BASE_EMISSIVE).lerp(MOON_ECLIPSE_EMISSIVE, strength);
@@ -1203,32 +1213,21 @@ function setEclipseGuideLine(from, to) {
 }
 
 function updateEclipseVisuals() {
-  if (!cinematic.active) {
+  if (!eclipseMode.active) {
     eclipseEffects.visible = false;
     setMoonEclipseTint(0);
     return;
   }
 
-  const daysFromPeak = Math.abs(cinematic.dateMs - cinematic.peakMs) / DAY_MS;
-  const proximity = clamp(1 - daysFromPeak / 0.8, 0, 1);
-  const currentEclipse = appState.sky ? appState.sky.eclipse : null;
-  const magnitude = currentEclipse
-    ? (currentEclipse.kind === 'solaire' ? currentEclipse.obscuration : currentEclipse.magnitude)
-    : 0;
-  const strength = cinematic.phase === 'hold'
-    ? 1
-    : Math.max(proximity * 0.75, proximity * magnitude);
-
-  cinematic.effectStrength = strength;
-  eclipseEffects.visible = strength > 0.01;
+  const strength = eclipseMode.phase === 'hold' ? 1 : eclipseMode.progress;
+  eclipseMode.effectStrength = strength;
+  eclipseEffects.visible = strength > 0.02;
   if (!eclipseEffects.visible) {
     setMoonEclipseTint(0);
     return;
   }
 
-  const kind = cinematic.eclipse
-    ? cinematic.eclipse.kind
-    : (currentEclipse ? currentEclipse.kind : 'lunaire');
+  const kind = eclipseMode.eclipse ? eclipseMode.eclipse.kind : 'lunaire';
 
   if (kind === 'lunaire') {
     // Ombre de la Terre projetée à l'opposé du Soleil.
@@ -1264,42 +1263,28 @@ function updateEclipseVisuals() {
   setMoonEclipseTint(strength);
 }
 
-function updateCinematicCamera() {
-  if (!cinematic.active) return;
-  const earthPos = earthGroup.position;
-  const progress = easeInOut(Math.min(1, cinematic.cameraElapsed / cinematic.cameraTweenDuration));
-  const axis = earthPos.clone().normalize();
-  const side = new THREE.Vector3().crossVectors(axis, UP).normalize();
-
-  // Centre la vue sur le milieu de la ligne Soleil–Terre–Lune. Pour une
-  // éclipse lunaire, la Lune prolonge la ligne derrière la Terre ; pour une
-  // éclipse solaire, elle se trouve entre le Soleil et la Terre.
-  const earthDistance = earthPos.length();
-  const isSolarEclipse = cinematic.eclipse && cinematic.eclipse.kind === 'solaire';
-  const lineCenterDistance = isSolarEclipse
-    ? earthDistance / 2
-    : (earthDistance + SCENE.MOON_ORBIT) / 2;
-  const targetOffset = new THREE.Vector3()
-    .copy(axis)
-    .multiplyScalar(lineCenterDistance - earthDistance);
-  const eclipseOffset = new THREE.Vector3()
-    .copy(side)
-    .multiplyScalar(19)
-    .addScaledVector(UP, 7)
-    .add(targetOffset);
-
-  const cameraOffset = new THREE.Vector3()
-    .copy(cinematic.normalCameraOffset)
-    .lerp(eclipseOffset, progress);
-  const currentTargetOffset = new THREE.Vector3()
-    .copy(cinematic.normalTargetOffset)
-    .lerp(targetOffset, progress);
-  camera.position.copy(earthPos).add(cameraOffset);
-  controls.target.copy(earthPos).add(currentTargetOffset);
+// Le nœud visé est celui des deux nœuds de l'orbite qui est le plus proche du
+// nœud réel et qui annule la latitude lunaire à la longitude de la syzygie.
+function computeTargetNode(moonLambdaDeg, realNodeDeg) {
+  const candidates = [normalizeDeg(moonLambdaDeg), normalizeDeg(moonLambdaDeg + 180)];
+  let best = candidates[0];
+  let bestDistance = Infinity;
+  for (const candidate of candidates) {
+    const distance = Math.abs(((candidate - realNodeDeg + 540) % 360) - 180);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = candidate;
+    }
+  }
+  return best;
 }
 
-function startEclipseCinematic() {
-  if (cinematic.active) return;
+function startEclipseMode() {
+  if (eclipseMode.active) {
+    stopEclipseMode();
+    return;
+  }
+
   const found = findNextEclipse(currentDateMs());
   if (!found) {
     ui.eclipseCinematicStatus.style.display = 'block';
@@ -1316,131 +1301,68 @@ function startEclipseCinematic() {
     ui.offsetContainer.style.display = 'none';
   }
 
-  cinematic.active = true;
-  cinematic.phase = 'approach';
-  cinematic.peakMs = found.ms;
-  cinematic.startMs = found.ms - 7 * DAY_MS;
-  cinematic.endMs = found.ms + 7 * DAY_MS;
-  cinematic.dateMs = cinematic.startMs;
-  cinematic.phaseElapsed = 0;
-  cinematic.cameraElapsed = 0;
-  cinematic.effectStrength = 0;
-  cinematic.eclipse = found.state.eclipse;
+  eclipseMode.active = true;
+  eclipseMode.phase = 'precession';
+  eclipseMode.dateMs = found.ms;
+  eclipseMode.eclipse = found.state.eclipse;
+  eclipseMode.progress = 0;
+  eclipseMode.duration = 5;
+  eclipseMode.targetNodeDeg = computeTargetNode(found.state.moon.lambdaDeg, found.state.moon.nodeDeg);
+  // Départ 40° en amont du nœud visé : la précession se voit, puis le plan
+  // orbital rejoint le nœud. L'inclinaison de 5,145° ne change jamais.
+  eclipseMode.nodeDeg = normalizeDeg(eclipseMode.targetNodeDeg + 40);
 
-  const earthPos = earthGroup.position;
-  cinematic.normalCameraOffset.copy(camera.position).sub(earthPos);
-  cinematic.normalTargetOffset.copy(controls.target).sub(earthPos);
-
-  controls.enabled = false;
+  // La simulation sous-jacente est calée sur l'éclipse pour que le curseur
+  // retrouve cet instant à la sortie du mode.
+  const phaseDays = (found.state.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
+  appState.simEpochMs = found.ms - phaseDays * DAY_MS;
+  appState.timeDays = phaseDays;
+  ui.time.value = String(phaseDays);
+  ui.timeVal.textContent = phaseDays.toFixed(2);
   ui.time.disabled = true;
   ui.play.disabled = true;
   ui.btnSyncTime.disabled = true;
   ui.btnNextEclipse.disabled = true;
-  ui.btnAnimateEclipse.disabled = true;
-  ui.btnResetView.style.display = 'block';
+  ui.btnAnimateEclipse.textContent = 'Quitter le mode éclipse';
+  ui.btnAnimateEclipse.classList.add('active');
   ui.eclipseCinematicStatus.style.display = 'block';
   ui.eclipseCinematicStatus.textContent =
-    `Animation : ${formatEclipseShort(cinematic.eclipse)} — ${formatDateCompact(cinematic.peakMs)}`;
+    `Précession des nœuds (accélérée) — ${formatEclipseShort(eclipseMode.eclipse)} — ${formatDateCompact(eclipseMode.dateMs)}`;
 
   updateScene();
-  updateCinematicCamera();
-  updateEclipseVisuals();
 }
 
-function advanceCinematic(deltaSeconds) {
-  if (!cinematic.active) return;
-  cinematic.phaseElapsed += deltaSeconds;
-  cinematic.cameraElapsed += deltaSeconds;
-
-  if (cinematic.phase === 'approach') {
-    const progress = Math.min(1, cinematic.phaseElapsed / cinematic.approachDuration);
-    cinematic.dateMs = cinematic.startMs + easeInOut(progress) * (cinematic.peakMs - cinematic.startMs);
-    if (progress >= 1) {
-      cinematic.phase = 'hold';
-      cinematic.phaseElapsed = 0;
-      cinematic.dateMs = cinematic.peakMs;
-    }
-  } else if (cinematic.phase === 'hold') {
-    cinematic.dateMs = cinematic.peakMs;
-    if (cinematic.phaseElapsed >= cinematic.holdDuration) {
-      cinematic.phase = 'depart';
-      cinematic.phaseElapsed = 0;
-      cinematic.dateMs = cinematic.peakMs;
-    }
-  } else if (cinematic.phase === 'depart') {
-    const progress = Math.min(1, cinematic.phaseElapsed / cinematic.departDuration);
-    cinematic.dateMs = cinematic.peakMs + easeInOut(progress) * (cinematic.endMs - cinematic.peakMs);
-    if (progress >= 1) {
-      finishEclipseCinematic();
-    }
+function advanceEclipseMode(deltaSeconds) {
+  if (!eclipseMode.active || eclipseMode.phase !== 'precession') return;
+  eclipseMode.progress = Math.min(1, eclipseMode.progress + deltaSeconds / eclipseMode.duration);
+  eclipseMode.nodeDeg = normalizeDeg(eclipseMode.targetNodeDeg + 40 * (1 - eclipseMode.progress));
+  if (eclipseMode.progress >= 1) {
+    eclipseMode.phase = 'hold';
+    eclipseMode.nodeDeg = normalizeDeg(eclipseMode.targetNodeDeg);
+    ui.eclipseCinematicStatus.textContent =
+      `Nœud orbital atteint — β = ${Math.abs(appState.visualBetaDeg).toFixed(1)}° · ${formatEclipseShort(eclipseMode.eclipse)}. Zoomez pour observer l'ombre.`;
   }
 }
 
-function finishEclipseCinematic() {
-  const finishedEclipse = cinematic.eclipse;
-  const endMs = cinematic.endMs;
-
-  cinematic.active = false;
-  cinematic.phase = 'idle';
-  cinematic.effectStrength = 0;
+function stopEclipseMode() {
+  if (!eclipseMode.active) return;
+  eclipseMode.active = false;
+  eclipseMode.phase = 'idle';
+  eclipseMode.progress = 0;
+  eclipseMode.effectStrength = 0;
   eclipseEffects.visible = false;
   setMoonEclipseTint(0);
-  controls.enabled = true;
-
-  const endState = computeSkyState(endMs);
-  const phaseDays = (endState.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
-  appState.simEpochMs = endMs - phaseDays * DAY_MS;
-  appState.timeDays = phaseDays;
-  ui.time.value = String(phaseDays);
-  ui.timeVal.textContent = phaseDays.toFixed(2);
-  ui.time.disabled = false;
-  ui.play.disabled = false;
-  ui.btnSyncTime.disabled = false;
-  ui.btnNextEclipse.disabled = false;
-  ui.btnAnimateEclipse.disabled = false;
-  ui.btnResetView.style.display = 'block';
-  ui.eclipseCinematicStatus.style.display = 'block';
-  ui.eclipseCinematicStatus.textContent =
-    `Terminé : ${formatEclipseShort(finishedEclipse)}. « Retour vue normale » pour revenir.`;
-
-  updateScene();
-  updateNextEclipseHint();
-}
-
-function resetEclipseView() {
-  const wasActive = cinematic.active;
-  const currentDate = cinematic.dateMs;
-
-  cinematic.active = false;
-  cinematic.phase = 'idle';
-  cinematic.effectStrength = 0;
-  eclipseEffects.visible = false;
-  setMoonEclipseTint(0);
-  controls.enabled = true;
-
-  if (wasActive) {
-    const currentState = computeSkyState(currentDate);
-    const phaseDays = (currentState.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
-    appState.simEpochMs = currentDate - phaseDays * DAY_MS;
-    appState.timeDays = phaseDays;
-    ui.time.value = String(phaseDays);
-    ui.timeVal.textContent = phaseDays.toFixed(2);
-  }
 
   ui.time.disabled = false;
   ui.play.disabled = false;
   ui.btnSyncTime.disabled = false;
   ui.btnNextEclipse.disabled = false;
-  ui.btnAnimateEclipse.disabled = false;
-  ui.btnResetView.style.display = 'none';
+  ui.btnAnimateEclipse.textContent = 'Mode Éclipse';
+  ui.btnAnimateEclipse.classList.remove('active');
   ui.eclipseCinematicStatus.style.display = 'block';
-  ui.eclipseCinematicStatus.textContent = 'Vue normale restaurée.';
+  ui.eclipseCinematicStatus.textContent = 'Mode éclipse quitté — la simulation reprend avec le nœud réel.';
 
-  const earthPos = earthGroup.position;
-  camera.position.copy(earthPos).add(cinematic.normalCameraOffset);
-  controls.target.copy(earthPos).add(cinematic.normalTargetOffset);
   updateScene();
-  updateNextEclipseHint();
 }
 
 // ==========================================
@@ -1783,8 +1705,7 @@ ui.btnNextEclipse.addEventListener('click', () => {
   }, 30);
 });
 
-ui.btnAnimateEclipse.addEventListener('click', startEclipseCinematic);
-ui.btnResetView.addEventListener('click', resetEclipseView);
+ui.btnAnimateEclipse.addEventListener('click', startEclipseMode);
 
 // ==========================================
 // 8. DIMENSIONNEMENT ET OBSERVATEURS DE TAILLE
@@ -1830,22 +1751,9 @@ function animate(now) {
   const deltaSeconds = Math.min((now - lastFrameTime) / 1000, 0.25);
   lastFrameTime = now;
 
-  if (cinematic.active) {
-    advanceCinematic(deltaSeconds);
-    if (cinematic.active) {
-      updateScene();
-      updateCinematicCamera();
-      updateEclipseVisuals();
-      if (cinematic.phase === 'hold') {
-        ui.eclipseCinematicStatus.textContent =
-          `Alignement nodal — β = ${appState.sky.moon.betaDeg.toFixed(1)}° · ${formatEclipseShort(cinematic.eclipse)}`;
-      } else if (cinematic.phase === 'depart') {
-        ui.eclipseCinematicStatus.textContent = 'La Lune reprend son inclinaison de 5,1°…';
-      }
-      const phaseDays = (appState.sky.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
-      ui.time.value = String(phaseDays);
-      ui.timeVal.textContent = phaseDays.toFixed(2);
-    }
+  if (eclipseMode.active) {
+    advanceEclipseMode(deltaSeconds);
+    updateScene();
   } else if (appState.isPlaying && !appState.useRealTime) {
     appState.timeDays += deltaSeconds * 0.15;
     if (appState.timeDays > ASTRONOMY.SYNODIC_MONTH_DAYS) {
@@ -1935,16 +1843,29 @@ function initialize() {
       getEarthPosition: () => earthGroup.position.toArray(),
       getMoonPosition: () => moonWorldPosition.toArray(),
       getCameraPosition: () => camera.position.toArray(),
+      getCameraTarget: () => controls.target.toArray(),
+      getControlsEnabled: () => controls.enabled,
+      setControlsDamping: (enabled) => { controls.enableDamping = enabled; },
+      setCameraView: (position, target) => {
+        camera.position.set(position[0], position[1], position[2]);
+        controls.target.set(target[0], target[1], target[2]);
+        controls.update();
+        updateScene();
+      },
       getSceneInfo: () => ({
         earthOrbitPoints: earthOrbitLine.geometry.attributes.position.count,
         moonOrbitInclinationDeg: moonOrbitTilt.rotation.x * RAD2DEG,
         eclipseEffectVisible: eclipseEffects.visible
       }),
-      getCinematic: () => ({
-        active: cinematic.active,
-        phase: cinematic.phase,
-        date: cinematic.dateMs,
-        strength: cinematic.effectStrength,
+      getEclipseMode: () => ({
+        active: eclipseMode.active,
+        phase: eclipseMode.phase,
+        date: eclipseMode.dateMs,
+        progress: eclipseMode.progress,
+        nodeDeg: eclipseMode.nodeDeg,
+        targetNodeDeg: eclipseMode.targetNodeDeg,
+        visualBetaDeg: appState.visualBetaDeg,
+        effectStrength: eclipseMode.effectStrength,
         effectVisible: eclipseEffects.visible
       })
     };
