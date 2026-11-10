@@ -204,6 +204,13 @@
     </div>
 
     <div class="control-group">
+      <label>Cinématique d'éclipse</label>
+      <button id="btnAnimateEclipse">▶ Animer Éclipse</button>
+      <button id="btnResetView" style="display:none; margin-top:6px;">↺ Retour vue normale</button>
+      <div id="eclipseCinematicStatus" class="hint" style="display:none;">—</div>
+    </div>
+
+    <div class="control-group">
       <label>Éclipses</label>
       <button id="btnNextEclipse">Aller à la prochaine éclipse</button>
       <div id="nextEclipse" class="hint">Recherche…</div>
@@ -238,6 +245,7 @@
   <span id="illum">Illumination : —</span>
   <span id="eclipse">Éclipse : aucune</span>
   <span id="skyDate">Date : —</span>
+  <span id="season">Saison (N) : —</span>
 </div>
 
 <div id="bootError" class="boot-error" role="alert" hidden>
@@ -639,6 +647,19 @@ function formatDate(milliseconds) {
   return `${dateFormatter.format(new Date(milliseconds))} UTC`;
 }
 
+const compactDateFormatter = new Intl.DateTimeFormat('fr-FR', {
+  day: '2-digit',
+  month: '2-digit',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  timeZone: 'UTC'
+});
+
+function formatDateCompact(milliseconds) {
+  return `${compactDateFormatter.format(new Date(milliseconds))} UTC`;
+}
+
 function formatEclipse(eclipse) {
   if (!eclipse) return 'Éclipse : aucune';
   const percent = Math.round((eclipse.kind === 'solaire' ? eclipse.obscuration : eclipse.magnitude) * 100);
@@ -647,6 +668,15 @@ function formatEclipse(eclipse) {
 
 function formatEclipseShort(eclipse) {
   return `Éclipse ${eclipse.kind} ${eclipse.type}`;
+}
+
+// Saisons de l'hémisphère nord, déterminées par la longitude géocentrique du
+// Soleil (0° = équinoxe de mars, 90° = solstice de juin, etc.).
+function getNorthernSeason(sunLongitudeDeg) {
+  if (sunLongitudeDeg < 90) return 'printemps';
+  if (sunLongitudeDeg < 180) return 'été';
+  if (sunLongitudeDeg < 270) return 'automne';
+  return 'hiver';
 }
 
 // ==========================================
@@ -782,6 +812,64 @@ const orbitLine = new THREE.Line(
 moonOrbitTilt.add(orbitLine);
 
 // ==========================================
+// 2bis. ORBITE ANNUELLE DE LA TERRE + EFFETS D'ÉCLIPSE
+// ==========================================
+const UP = new THREE.Vector3(0, 1, 0);
+const CAMERA_START_OFFSET = new THREE.Vector3(-3, 4, 8);
+const EARTH_ORBIT_A = SCENE.EARTH_ORBIT;
+const EARTH_ORBIT_E = 0.0167;
+const EARTH_PERIHELION_DEG = 102.937;
+
+// Ligne de l'orbite annuelle : ellipse réelle (e = 0,0167) dans le plan
+// écliptique, centrée sur le Soleil.
+const earthOrbitPoints = [];
+const EARTH_ORBIT_SEGMENTS = 256;
+for (let i = 0; i <= EARTH_ORBIT_SEGMENTS; i++) {
+  const trueAnomaly = (i / EARTH_ORBIT_SEGMENTS) * TAU;
+  const radius = EARTH_ORBIT_A
+    * (1 - EARTH_ORBIT_E * EARTH_ORBIT_E)
+    / (1 + EARTH_ORBIT_E * Math.cos(trueAnomaly));
+  const lambda = EARTH_PERIHELION_DEG + trueAnomaly * RAD2DEG;
+  const direction = eclipticUnit(lambda, 0);
+  earthOrbitPoints.push(new THREE.Vector3(direction.x * radius, 0, direction.z * radius));
+}
+const earthOrbitLine = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints(earthOrbitPoints),
+  new THREE.LineBasicMaterial({ color: 0x445577, transparent: true, opacity: 0.55 })
+);
+scene.add(earthOrbitLine);
+
+// Effets visuels de la cinématique d'éclipse (invisibles au repos).
+const eclipseEffects = new THREE.Group();
+eclipseEffects.visible = false;
+scene.add(eclipseEffects);
+
+const earthUmbra = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.12, 0.65, 1, 32, 1, true),
+  new THREE.MeshBasicMaterial({ color: 0x05050c, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })
+);
+const earthPenumbra = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.35, 0.95, 1, 32, 1, true),
+  new THREE.MeshBasicMaterial({ color: 0x101024, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })
+);
+const moonUmbra = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.02, 0.25, 1, 24, 1, true),
+  new THREE.MeshBasicMaterial({ color: 0x05050c, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })
+);
+eclipseEffects.add(earthUmbra, earthPenumbra, moonUmbra);
+
+const eclipseGuideLine = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+  new THREE.LineBasicMaterial({ color: 0xffcc66, transparent: true, opacity: 0 })
+);
+eclipseEffects.add(eclipseGuideLine);
+
+const MOON_BASE_COLOR = new THREE.Color(0xffffff);
+const MOON_ECLIPSE_COLOR = new THREE.Color(0xb5543a);
+const MOON_BASE_EMISSIVE = new THREE.Color(0x000000);
+const MOON_ECLIPSE_EMISSIVE = new THREE.Color(0x2a0b00);
+
+// ==========================================
 // 3. ÉTAT ET ÉLÉMENTS D'INTERFACE
 // ==========================================
 const appState = {
@@ -794,6 +882,29 @@ const appState = {
   simEpochMs: ASTRONOMY.NEW_MOON_EPOCH_MS,
   sky: null
 };
+
+const cinematic = {
+  active: false,
+  phase: 'idle',
+  peakMs: 0,
+  startMs: 0,
+  endMs: 0,
+  dateMs: 0,
+  phaseElapsed: 0,
+  cameraElapsed: 0,
+  cameraTweenDuration: 2.5,
+  approachDuration: 5,
+  holdDuration: 3,
+  departDuration: 5,
+  normalCameraOffset: new THREE.Vector3(),
+  normalTargetOffset: new THREE.Vector3(),
+  effectStrength: 0,
+  eclipse: null
+};
+let cameraInitialized = false;
+const previousEarthPosition = new THREE.Vector3(SCENE.EARTH_ORBIT, 0, 0);
+const earthDelta = new THREE.Vector3();
+const earthPositionVector = new THREE.Vector3();
 
 const ui = {
   controls: document.getElementById('controls'),
@@ -825,6 +936,10 @@ const ui = {
   illum: document.getElementById('illum'),
   eclipse: document.getElementById('eclipse'),
   skyDate: document.getElementById('skyDate'),
+  season: document.getElementById('season'),
+  btnAnimateEclipse: document.getElementById('btnAnimateEclipse'),
+  btnResetView: document.getElementById('btnResetView'),
+  eclipseCinematicStatus: document.getElementById('eclipseCinematicStatus'),
   hud: document.getElementById('hud')
 };
 
@@ -962,6 +1077,7 @@ function updateHud(sky, dateMs) {
   ui.eclipse.dataset.kind = sky.eclipse ? sky.eclipse.kind : '';
   ui.eclipse.classList.toggle('active', Boolean(sky.eclipse));
   ui.skyDate.textContent = `Date : ${formatDate(dateMs)}`;
+  ui.season.textContent = `Saison (N) : ${getNorthernSeason(sky.sun.lambdaDeg)}`;
 }
 
 // ==========================================
@@ -977,6 +1093,7 @@ const zenithA = new THREE.Vector3();
 const zenithB = new THREE.Vector3();
 
 function currentDateMs() {
+  if (cinematic.active) return cinematic.dateMs;
   return appState.useRealTime
     ? Date.now() + appState.timeOffset * DAY_MS
     : appState.simEpochMs + appState.timeDays * DAY_MS;
@@ -997,20 +1114,45 @@ function updateScene() {
   const sky = computeSkyState(dateMs);
   appState.sky = sky;
 
-  // Position apparente de la Lune : on conserve le Soleil fixe à -x et on
-  // translate la longitude écliptique réelle par rapport à celle du Soleil.
-  const moonSceneLambda = normalizeDeg(sky.moon.lambdaDeg - sky.sun.lambdaDeg + 180);
-  const moonSceneDirection = eclipticUnit(moonSceneLambda, sky.moon.betaDeg);
+  // La Lune est placée dans le repère écliptique absolu (le Soleil est à
+  // l'origine), ce qui reste correct quand la Terre se déplace sur son orbite.
   const moonOrbitRadius = SCENE.MOON_ORBIT * (sky.moon.distanceKm / ASTRONOMY.MOON_MEAN_DISTANCE_KM);
+  const moonAbsoluteDirection = eclipticUnit(sky.moon.lambdaDeg, sky.moon.betaDeg);
   moon.position.set(
-    moonSceneDirection.x * moonOrbitRadius,
-    moonSceneDirection.y * moonOrbitRadius,
-    moonSceneDirection.z * moonOrbitRadius
+    moonAbsoluteDirection.x * moonOrbitRadius,
+    moonAbsoluteDirection.y * moonOrbitRadius,
+    moonAbsoluteDirection.z * moonOrbitRadius
   );
 
-  // Orientation de la ligne des nœuds : c'est elle qui décale les éclipses
-  // par rapport aux nouvelles et pleines lunes.
-  moonOrbitPlane.rotation.y = normalizeDeg(sky.moon.nodeDeg - sky.sun.lambdaDeg + 180) * DEG2RAD;
+  // Ligne des nœuds dans le plan écliptique absolu.
+  moonOrbitPlane.rotation.y = normalizeDeg(sky.moon.nodeDeg) * DEG2RAD;
+
+  // Orbite annuelle de la Terre : la longitude héliocentrique est l'opposé de
+  // la longitude géocentrique du Soleil ; la distance à l'échelle de la scène
+  // suit la distance réelle en UA.
+  const earthHeliocentricLongitude = normalizeDeg(sky.sun.lambdaDeg + 180);
+  const earthOrbitRadius = SCENE.EARTH_ORBIT * sky.sun.distanceAU;
+  const earthDirection = eclipticUnit(earthHeliocentricLongitude, 0);
+  earthPositionVector.set(
+    earthDirection.x * earthOrbitRadius,
+    0,
+    earthDirection.z * earthOrbitRadius
+  );
+  earthDelta.copy(earthPositionVector).sub(previousEarthPosition);
+  earthGroup.position.copy(earthPositionVector);
+  moonOrbitGroup.position.copy(earthPositionVector);
+
+  // La caméra suit la Terre sur son orbite (sauf pendant la cinématique, où
+  // la vue d'alignement est gérée séparément).
+  if (!cameraInitialized) {
+    camera.position.copy(earthPositionVector).add(CAMERA_START_OFFSET);
+    controls.target.copy(earthPositionVector);
+    cameraInitialized = true;
+  } else if (!cinematic.active) {
+    camera.position.add(earthDelta);
+    controls.target.add(earthDelta);
+  }
+  previousEarthPosition.copy(earthPositionVector);
 
   // Rotation terrestre : jour sidéral réel (0,99727 jour).
   earth.rotation.y = (TAU / 0.99726968) * positiveMod(sky.days, 0.99726968);
@@ -1037,6 +1179,268 @@ function updateScene() {
   drawMoonPhase(ui.canvasA, ui.labelA, ui.statusA, sky, appState.latitudeA, aboveHorizonA, isDayA);
   drawMoonPhase(ui.canvasB, ui.labelB, ui.statusB, sky, -appState.latitudeA, aboveHorizonB, isDayB);
   updateHud(sky, dateMs);
+}
+
+// ==========================================
+// 5bis. CINÉMATIQUE D'ÉCLIPSE (NŒUD ORBITAL)
+// ==========================================
+function easeInOut(t) {
+  const clamped = clamp(t, 0, 1);
+  return clamped * clamped * (3 - 2 * clamped);
+}
+
+function setMoonEclipseTint(strength) {
+  moonMaterial.color.copy(MOON_BASE_COLOR).lerp(MOON_ECLIPSE_COLOR, strength);
+  moonMaterial.emissive.copy(MOON_BASE_EMISSIVE).lerp(MOON_ECLIPSE_EMISSIVE, strength);
+  moonMaterial.emissiveIntensity = 0.7 + 0.6 * strength;
+}
+
+function setEclipseGuideLine(from, to) {
+  const positions = eclipseGuideLine.geometry.attributes.position;
+  positions.setXYZ(0, from.x, from.y, from.z);
+  positions.setXYZ(1, to.x, to.y, to.z);
+  positions.needsUpdate = true;
+}
+
+function updateEclipseVisuals() {
+  if (!cinematic.active) {
+    eclipseEffects.visible = false;
+    setMoonEclipseTint(0);
+    return;
+  }
+
+  const daysFromPeak = Math.abs(cinematic.dateMs - cinematic.peakMs) / DAY_MS;
+  const proximity = clamp(1 - daysFromPeak / 0.8, 0, 1);
+  const currentEclipse = appState.sky ? appState.sky.eclipse : null;
+  const magnitude = currentEclipse
+    ? (currentEclipse.kind === 'solaire' ? currentEclipse.obscuration : currentEclipse.magnitude)
+    : 0;
+  const strength = cinematic.phase === 'hold'
+    ? 1
+    : Math.max(proximity * 0.75, proximity * magnitude);
+
+  cinematic.effectStrength = strength;
+  eclipseEffects.visible = strength > 0.01;
+  if (!eclipseEffects.visible) {
+    setMoonEclipseTint(0);
+    return;
+  }
+
+  const kind = cinematic.eclipse
+    ? cinematic.eclipse.kind
+    : (currentEclipse ? currentEclipse.kind : 'lunaire');
+
+  if (kind === 'lunaire') {
+    // Ombre de la Terre projetée à l'opposé du Soleil.
+    const axis = earthGroup.position.clone().normalize();
+    const height = 5.5;
+    earthUmbra.visible = true;
+    earthPenumbra.visible = true;
+    moonUmbra.visible = false;
+    earthUmbra.scale.set(1, height, 1);
+    earthPenumbra.scale.set(1, height, 1);
+    earthUmbra.position.copy(earthGroup.position).addScaledVector(axis, height / 2);
+    earthPenumbra.position.copy(earthUmbra.position);
+    earthUmbra.quaternion.setFromUnitVectors(UP, axis);
+    earthPenumbra.quaternion.copy(earthUmbra.quaternion);
+    earthUmbra.material.opacity = 0.4 * strength;
+    earthPenumbra.material.opacity = 0.12 * strength;
+    setEclipseGuideLine(new THREE.Vector3(0, 0, 0), moonWorldPosition);
+  } else {
+    // Ombre de la Lune projetée vers la Terre.
+    const axis = earthGroup.position.clone().sub(moonWorldPosition).normalize();
+    const distance = earthGroup.position.distanceTo(moonWorldPosition);
+    moonUmbra.visible = true;
+    earthUmbra.visible = false;
+    earthPenumbra.visible = false;
+    moonUmbra.scale.set(0.8, distance, 0.8);
+    moonUmbra.position.copy(moonWorldPosition).addScaledVector(axis, distance / 2);
+    moonUmbra.quaternion.setFromUnitVectors(UP, axis);
+    moonUmbra.material.opacity = 0.4 * strength;
+    setEclipseGuideLine(new THREE.Vector3(0, 0, 0), earthGroup.position);
+  }
+
+  eclipseGuideLine.material.opacity = 0.65 * strength;
+  setMoonEclipseTint(strength);
+}
+
+function updateCinematicCamera() {
+  if (!cinematic.active) return;
+  const earthPos = earthGroup.position;
+  const progress = easeInOut(Math.min(1, cinematic.cameraElapsed / cinematic.cameraTweenDuration));
+  const axis = earthPos.clone().normalize();
+  const side = new THREE.Vector3().crossVectors(axis, UP).normalize();
+
+  // Centre la vue sur le milieu de la ligne Soleil–Terre–Lune. Pour une
+  // éclipse lunaire, la Lune prolonge la ligne derrière la Terre ; pour une
+  // éclipse solaire, elle se trouve entre le Soleil et la Terre.
+  const earthDistance = earthPos.length();
+  const isSolarEclipse = cinematic.eclipse && cinematic.eclipse.kind === 'solaire';
+  const lineCenterDistance = isSolarEclipse
+    ? earthDistance / 2
+    : (earthDistance + SCENE.MOON_ORBIT) / 2;
+  const targetOffset = new THREE.Vector3()
+    .copy(axis)
+    .multiplyScalar(lineCenterDistance - earthDistance);
+  const eclipseOffset = new THREE.Vector3()
+    .copy(side)
+    .multiplyScalar(19)
+    .addScaledVector(UP, 7)
+    .add(targetOffset);
+
+  const cameraOffset = new THREE.Vector3()
+    .copy(cinematic.normalCameraOffset)
+    .lerp(eclipseOffset, progress);
+  const currentTargetOffset = new THREE.Vector3()
+    .copy(cinematic.normalTargetOffset)
+    .lerp(targetOffset, progress);
+  camera.position.copy(earthPos).add(cameraOffset);
+  controls.target.copy(earthPos).add(currentTargetOffset);
+}
+
+function startEclipseCinematic() {
+  if (cinematic.active) return;
+  const found = findNextEclipse(currentDateMs());
+  if (!found) {
+    ui.eclipseCinematicStatus.style.display = 'block';
+    ui.eclipseCinematicStatus.textContent = 'Aucune éclipse détectée dans les 400 prochains jours.';
+    return;
+  }
+
+  appState.isPlaying = false;
+  ui.play.textContent = '▶ Animer';
+  if (appState.useRealTime) {
+    appState.useRealTime = false;
+    ui.btnSyncTime.textContent = 'Passer en Temps Réel';
+    ui.btnSyncTime.classList.remove('active');
+    ui.offsetContainer.style.display = 'none';
+  }
+
+  cinematic.active = true;
+  cinematic.phase = 'approach';
+  cinematic.peakMs = found.ms;
+  cinematic.startMs = found.ms - 7 * DAY_MS;
+  cinematic.endMs = found.ms + 7 * DAY_MS;
+  cinematic.dateMs = cinematic.startMs;
+  cinematic.phaseElapsed = 0;
+  cinematic.cameraElapsed = 0;
+  cinematic.effectStrength = 0;
+  cinematic.eclipse = found.state.eclipse;
+
+  const earthPos = earthGroup.position;
+  cinematic.normalCameraOffset.copy(camera.position).sub(earthPos);
+  cinematic.normalTargetOffset.copy(controls.target).sub(earthPos);
+
+  controls.enabled = false;
+  ui.time.disabled = true;
+  ui.play.disabled = true;
+  ui.btnSyncTime.disabled = true;
+  ui.btnNextEclipse.disabled = true;
+  ui.btnAnimateEclipse.disabled = true;
+  ui.btnResetView.style.display = 'block';
+  ui.eclipseCinematicStatus.style.display = 'block';
+  ui.eclipseCinematicStatus.textContent =
+    `Animation : ${formatEclipseShort(cinematic.eclipse)} — ${formatDateCompact(cinematic.peakMs)}`;
+
+  updateScene();
+  updateCinematicCamera();
+  updateEclipseVisuals();
+}
+
+function advanceCinematic(deltaSeconds) {
+  if (!cinematic.active) return;
+  cinematic.phaseElapsed += deltaSeconds;
+  cinematic.cameraElapsed += deltaSeconds;
+
+  if (cinematic.phase === 'approach') {
+    const progress = Math.min(1, cinematic.phaseElapsed / cinematic.approachDuration);
+    cinematic.dateMs = cinematic.startMs + easeInOut(progress) * (cinematic.peakMs - cinematic.startMs);
+    if (progress >= 1) {
+      cinematic.phase = 'hold';
+      cinematic.phaseElapsed = 0;
+      cinematic.dateMs = cinematic.peakMs;
+    }
+  } else if (cinematic.phase === 'hold') {
+    cinematic.dateMs = cinematic.peakMs;
+    if (cinematic.phaseElapsed >= cinematic.holdDuration) {
+      cinematic.phase = 'depart';
+      cinematic.phaseElapsed = 0;
+      cinematic.dateMs = cinematic.peakMs;
+    }
+  } else if (cinematic.phase === 'depart') {
+    const progress = Math.min(1, cinematic.phaseElapsed / cinematic.departDuration);
+    cinematic.dateMs = cinematic.peakMs + easeInOut(progress) * (cinematic.endMs - cinematic.peakMs);
+    if (progress >= 1) {
+      finishEclipseCinematic();
+    }
+  }
+}
+
+function finishEclipseCinematic() {
+  const finishedEclipse = cinematic.eclipse;
+  const endMs = cinematic.endMs;
+
+  cinematic.active = false;
+  cinematic.phase = 'idle';
+  cinematic.effectStrength = 0;
+  eclipseEffects.visible = false;
+  setMoonEclipseTint(0);
+  controls.enabled = true;
+
+  const endState = computeSkyState(endMs);
+  const phaseDays = (endState.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
+  appState.simEpochMs = endMs - phaseDays * DAY_MS;
+  appState.timeDays = phaseDays;
+  ui.time.value = String(phaseDays);
+  ui.timeVal.textContent = phaseDays.toFixed(2);
+  ui.time.disabled = false;
+  ui.play.disabled = false;
+  ui.btnSyncTime.disabled = false;
+  ui.btnNextEclipse.disabled = false;
+  ui.btnAnimateEclipse.disabled = false;
+  ui.btnResetView.style.display = 'block';
+  ui.eclipseCinematicStatus.style.display = 'block';
+  ui.eclipseCinematicStatus.textContent =
+    `Terminé : ${formatEclipseShort(finishedEclipse)}. « Retour vue normale » pour revenir.`;
+
+  updateScene();
+  updateNextEclipseHint();
+}
+
+function resetEclipseView() {
+  const wasActive = cinematic.active;
+  const currentDate = cinematic.dateMs;
+
+  cinematic.active = false;
+  cinematic.phase = 'idle';
+  cinematic.effectStrength = 0;
+  eclipseEffects.visible = false;
+  setMoonEclipseTint(0);
+  controls.enabled = true;
+
+  if (wasActive) {
+    const currentState = computeSkyState(currentDate);
+    const phaseDays = (currentState.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
+    appState.simEpochMs = currentDate - phaseDays * DAY_MS;
+    appState.timeDays = phaseDays;
+    ui.time.value = String(phaseDays);
+    ui.timeVal.textContent = phaseDays.toFixed(2);
+  }
+
+  ui.time.disabled = false;
+  ui.play.disabled = false;
+  ui.btnSyncTime.disabled = false;
+  ui.btnNextEclipse.disabled = false;
+  ui.btnAnimateEclipse.disabled = false;
+  ui.btnResetView.style.display = 'none';
+  ui.eclipseCinematicStatus.style.display = 'block';
+  ui.eclipseCinematicStatus.textContent = 'Vue normale restaurée.';
+
+  const earthPos = earthGroup.position;
+  camera.position.copy(earthPos).add(cinematic.normalCameraOffset);
+  controls.target.copy(earthPos).add(cinematic.normalTargetOffset);
+  updateScene();
+  updateNextEclipseHint();
 }
 
 // ==========================================
@@ -1098,7 +1502,7 @@ function layoutPanelsForSmallScreens() {
   setPanelRect(ui.panelB, gap, gap, phaseWidth, phaseHeight);
   setPanelRect(ui.panelA, viewportWidth - phaseWidth - gap, gap, phaseWidth, phaseHeight);
   setPanelRect(ui.controls, gap, lowerTop, columnWidth, Math.min(lowerHeight, 230));
-  setPanelRect(ui.advancedPanel, viewportWidth - columnWidth - gap, lowerTop, columnWidth, Math.min(lowerHeight, 280));
+  setPanelRect(ui.advancedPanel, viewportWidth - columnWidth - gap, lowerTop, columnWidth, Math.min(lowerHeight, 360));
 }
 
 function makeInteractive(panel) {
@@ -1379,6 +1783,9 @@ ui.btnNextEclipse.addEventListener('click', () => {
   }, 30);
 });
 
+ui.btnAnimateEclipse.addEventListener('click', startEclipseCinematic);
+ui.btnResetView.addEventListener('click', resetEclipseView);
+
 // ==========================================
 // 8. DIMENSIONNEMENT ET OBSERVATEURS DE TAILLE
 // ==========================================
@@ -1423,7 +1830,23 @@ function animate(now) {
   const deltaSeconds = Math.min((now - lastFrameTime) / 1000, 0.25);
   lastFrameTime = now;
 
-  if (appState.isPlaying && !appState.useRealTime) {
+  if (cinematic.active) {
+    advanceCinematic(deltaSeconds);
+    if (cinematic.active) {
+      updateScene();
+      updateCinematicCamera();
+      updateEclipseVisuals();
+      if (cinematic.phase === 'hold') {
+        ui.eclipseCinematicStatus.textContent =
+          `Alignement nodal — β = ${appState.sky.moon.betaDeg.toFixed(1)}° · ${formatEclipseShort(cinematic.eclipse)}`;
+      } else if (cinematic.phase === 'depart') {
+        ui.eclipseCinematicStatus.textContent = 'La Lune reprend son inclinaison de 5,1°…';
+      }
+      const phaseDays = (appState.sky.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
+      ui.time.value = String(phaseDays);
+      ui.timeVal.textContent = phaseDays.toFixed(2);
+    }
+  } else if (appState.isPlaying && !appState.useRealTime) {
     appState.timeDays += deltaSeconds * 0.15;
     if (appState.timeDays > ASTRONOMY.SYNODIC_MONTH_DAYS) {
       appState.timeDays -= ASTRONOMY.SYNODIC_MONTH_DAYS;
@@ -1504,7 +1927,27 @@ function initialize() {
   window.setTimeout(updateNextEclipseHint, 0);
 
   if (new URLSearchParams(window.location.search).has('debug')) {
-    window.__moonDebug = { computeSkyState, findNextEclipse, getPhaseInfo, formatEclipse };
+    window.__moonDebug = {
+      computeSkyState,
+      findNextEclipse,
+      getPhaseInfo,
+      formatEclipse,
+      getEarthPosition: () => earthGroup.position.toArray(),
+      getMoonPosition: () => moonWorldPosition.toArray(),
+      getCameraPosition: () => camera.position.toArray(),
+      getSceneInfo: () => ({
+        earthOrbitPoints: earthOrbitLine.geometry.attributes.position.count,
+        moonOrbitInclinationDeg: moonOrbitTilt.rotation.x * RAD2DEG,
+        eclipseEffectVisible: eclipseEffects.visible
+      }),
+      getCinematic: () => ({
+        active: cinematic.active,
+        phase: cinematic.phase,
+        date: cinematic.dateMs,
+        strength: cinematic.effectStrength,
+        effectVisible: eclipseEffects.visible
+      })
+    };
   }
 }
 
