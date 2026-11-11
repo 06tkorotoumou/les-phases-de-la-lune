@@ -105,14 +105,16 @@
     .time-mode { display: flex; gap: 6px; margin: 2px 0 6px; }
     .time-mode button { flex: 1; padding: 5px 6px; font-size: 11px; }
     .time-mode button.active { background: #2266aa; border-color: #44aaff; }
+    .checkbox-label { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 4px; }
+    .checkbox-label input { width: auto; margin: 0; }
 
     /* ---- PANNEAU OPTIONS AVANCÉES ---- */
-    #advancedPanel { width: 220px; top: 300px; left: 10px; max-height: calc(100vh - 340px); }
+    #advancedPanel { width: 220px; top: 350px; left: 10px; max-height: calc(100vh - 390px); }
     #advancedPanel .content { padding: 12px; flex: 1; overflow-y: auto; min-height: 0; }
 
     /* Écrans peu hauts (téléphones en paysage) : garder la poignée visible. */
     @media (min-width: 721px) and (max-height: 720px) {
-      #advancedPanel { max-height: calc(100vh - 360px); }
+      #advancedPanel { max-height: calc(100vh - 410px); }
     }
 
     .control-group { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px dashed #333; }
@@ -180,6 +182,12 @@
     </div>
     <div class="hint">Mois : 29,5 j · Année : 365,24 j (révolution complète)</div>
     <label>Temps (jours) : <input type="range" id="time" min="0" max="29.53" value="0" step="0.01"> <span id="timeVal">0.00</span></label>
+    <div id="yearOptions" style="display:none;">
+      <label>Vitesse : <span id="yearSpeedVal">10</span> j/s
+        <input type="range" id="yearSpeed" min="1" max="30" step="1" value="10">
+      </label>
+      <label class="checkbox-label"><input type="checkbox" id="pauseEclipses" checked> Pause aux éclipses</label>
+    </div>
     <button id="play" style="width:100%">▶ Animer</button>
   </div>
 </div>
@@ -914,6 +922,12 @@ const appState = {
   useRealTime: false,
   timeOffset: 0,
   timeMode: 'month', // 'month' (cycle lunaire) ou 'year' (révolution complète)
+  yearSpeed: 10, // jours simulés par seconde en mode Année
+  pauseEclipses: true, // ralentit et fait une pause pour montrer l'alignement
+  nextEclipse: null, // { ms, state } pour le mode Année
+  eclipseHoldUntil: 0,
+  heldEclipsePeakMs: 0,
+  autoEclipseStrength: 0,
   simEpochMs: ASTRONOMY.NEW_MOON_EPOCH_MS,
   sky: null,
   visualNodeDeg: 0,
@@ -953,6 +967,10 @@ const ui = {
   timeVal: document.getElementById('timeVal'),
   timeModeMonth: document.getElementById('timeModeMonth'),
   timeModeYear: document.getElementById('timeModeYear'),
+  yearOptions: document.getElementById('yearOptions'),
+  yearSpeed: document.getElementById('yearSpeed'),
+  yearSpeedVal: document.getElementById('yearSpeedVal'),
+  pauseEclipses: document.getElementById('pauseEclipses'),
   play: document.getElementById('play'),
   btnTextures: document.getElementById('btnTextures'),
   citySelect: document.getElementById('citySelect'),
@@ -1208,7 +1226,7 @@ function updateScene() {
   drawMoonPhase(ui.canvasB, ui.labelB, ui.statusB, sky, -appState.latitudeA, aboveHorizonB, isDayB);
   updateHud(sky, dateMs);
 
-  if (eclipseMode.active) updateEclipseVisuals();
+  if (eclipseMode.active || appState.timeMode === 'year') updateEclipseVisuals();
 }
 
 // ==========================================
@@ -1228,21 +1246,27 @@ function setEclipseGuideLine(from, to) {
 }
 
 function updateEclipseVisuals() {
-  if (!eclipseMode.active) {
-    eclipseEffects.visible = false;
-    setMoonEclipseTint(0);
-    return;
+  let strength = 0;
+  let kind = 'lunaire';
+
+  if (eclipseMode.active) {
+    strength = eclipseMode.phase === 'hold' ? 1 : eclipseMode.progress;
+    eclipseMode.effectStrength = strength;
+    kind = eclipseMode.eclipse ? eclipseMode.eclipse.kind : 'lunaire';
+  } else if (appState.timeMode === 'year' && appState.sky && appState.sky.eclipse) {
+    // En mode Année, les éclipses se produisent naturellement : on affiche
+    // l'ombre et la ligne d'alignement sans demander le mode Éclipse.
+    const auto = appState.sky.eclipse;
+    strength = Math.max(0.35, auto.kind === 'solaire' ? auto.obscuration : auto.magnitude);
+    kind = auto.kind;
   }
 
-  const strength = eclipseMode.phase === 'hold' ? 1 : eclipseMode.progress;
-  eclipseMode.effectStrength = strength;
+  appState.autoEclipseStrength = strength;
   eclipseEffects.visible = strength > 0.02;
   if (!eclipseEffects.visible) {
     setMoonEclipseTint(0);
     return;
   }
-
-  const kind = eclipseMode.eclipse ? eclipseMode.eclipse.kind : 'lunaire';
 
   if (kind === 'lunaire') {
     // Ombre de la Terre projetée à l'opposé du Soleil.
@@ -1338,6 +1362,8 @@ function startEclipseMode() {
   ui.btnNextEclipse.disabled = true;
   ui.timeModeMonth.disabled = true;
   ui.timeModeYear.disabled = true;
+  ui.yearSpeed.disabled = true;
+  ui.pauseEclipses.disabled = true;
   ui.btnAnimateEclipse.textContent = 'Quitter le mode éclipse';
   ui.btnAnimateEclipse.classList.add('active');
   ui.eclipseCinematicStatus.style.display = 'block';
@@ -1374,11 +1400,15 @@ function stopEclipseMode() {
   ui.btnNextEclipse.disabled = false;
   ui.timeModeMonth.disabled = false;
   ui.timeModeYear.disabled = false;
+  ui.yearSpeed.disabled = false;
+  ui.pauseEclipses.disabled = false;
   ui.btnAnimateEclipse.textContent = 'Mode Éclipse';
   ui.btnAnimateEclipse.classList.remove('active');
   ui.eclipseCinematicStatus.style.display = 'block';
+  ui.eclipseCinematicStatus.dataset.yearStatus = '';
   ui.eclipseCinematicStatus.textContent = 'Mode éclipse quitté — la simulation reprend avec le nœud réel.';
 
+  refreshYearNextEclipse();
   updateScene();
 }
 
@@ -1440,7 +1470,7 @@ function layoutPanelsForSmallScreens() {
 
   setPanelRect(ui.panelB, gap, gap, phaseWidth, phaseHeight);
   setPanelRect(ui.panelA, viewportWidth - phaseWidth - gap, gap, phaseWidth, phaseHeight);
-  setPanelRect(ui.controls, gap, lowerTop, columnWidth, Math.min(lowerHeight, 270));
+  setPanelRect(ui.controls, gap, lowerTop, columnWidth, Math.min(lowerHeight, 320));
   setPanelRect(ui.advancedPanel, viewportWidth - columnWidth - gap, lowerTop, columnWidth, Math.min(lowerHeight, 360));
 }
 
@@ -1599,6 +1629,9 @@ function formatTimeValue(days) {
 
 function setTimeDays(days) {
   appState.timeDays = clamp(days, 0, getTimeMax());
+  // Toute navigation manuelle invalide la prochaine éclipse en cache : on la
+  // recalculera depuis la nouvelle date.
+  appState.nextEclipse = null;
   ui.time.value = String(appState.timeDays);
   ui.timeVal.textContent = formatTimeValue(appState.timeDays);
 }
@@ -1619,8 +1652,44 @@ function setTimeMode(mode) {
   ui.timeModeYear.classList.toggle('active', mode === 'year');
   ui.timeModeMonth.setAttribute('aria-pressed', String(mode === 'month'));
   ui.timeModeYear.setAttribute('aria-pressed', String(mode === 'year'));
+  ui.yearOptions.style.display = mode === 'year' ? 'block' : 'none';
+  appState.eclipseHoldUntil = 0;
+  appState.heldEclipsePeakMs = 0;
+  appState.nextEclipse = null;
+  refreshYearNextEclipse();
+  hideYearEclipseStatus();
   updateNextEclipseHint();
   updateScene();
+}
+
+// Prépare la prochaine éclipse pour le mode Année (ralentissement/pause).
+function refreshYearNextEclipse() {
+  if (appState.timeMode !== 'year' || eclipseMode.active) {
+    appState.nextEclipse = null;
+    return;
+  }
+  const now = currentDateMs();
+  if (!appState.nextEclipse || now > appState.nextEclipse.ms + 0.75 * DAY_MS) {
+    appState.nextEclipse = findNextEclipse(now);
+  }
+}
+
+function showYearEclipseStatus(text) {
+  ui.eclipseCinematicStatus.style.display = 'block';
+  ui.eclipseCinematicStatus.dataset.yearStatus = '1';
+  ui.eclipseCinematicStatus.textContent = text;
+}
+
+function hideYearEclipseStatus() {
+  if (eclipseMode.active) return;
+  ui.eclipseCinematicStatus.style.display = 'none';
+  ui.eclipseCinematicStatus.dataset.yearStatus = '';
+  ui.eclipseCinematicStatus.textContent = '—';
+}
+
+function formatApproach(days) {
+  if (days >= 1) return `${days.toFixed(1)} j`;
+  return `${Math.max(1, Math.round(days * 24))} h`;
 }
 
 function setRealTime(enabled) {
@@ -1632,6 +1701,8 @@ function setRealTime(enabled) {
   ui.play.disabled = enabled;
   ui.timeModeMonth.disabled = enabled;
   ui.timeModeYear.disabled = enabled;
+  ui.yearSpeed.disabled = enabled;
+  ui.pauseEclipses.disabled = enabled;
   updateNextEclipseHint();
   updateScene();
 }
@@ -1668,13 +1739,31 @@ ui.lat.addEventListener('input', (event) => {
 
 ui.time.addEventListener('input', (event) => {
   setTimeDays(parseFloat(event.target.value));
+  refreshYearNextEclipse();
+  hideYearEclipseStatus();
   if (!appState.useRealTime) updateScene();
 });
 
-ui.time.addEventListener('change', updateNextEclipseHint);
+ui.time.addEventListener('change', () => {
+  refreshYearNextEclipse();
+  updateNextEclipseHint();
+});
 
 ui.timeModeMonth.addEventListener('click', () => setTimeMode('month'));
 ui.timeModeYear.addEventListener('click', () => setTimeMode('year'));
+
+ui.yearSpeed.addEventListener('input', (event) => {
+  appState.yearSpeed = parseFloat(event.target.value);
+  ui.yearSpeedVal.textContent = String(appState.yearSpeed);
+});
+
+ui.pauseEclipses.addEventListener('change', (event) => {
+  appState.pauseEclipses = event.target.checked;
+  if (!appState.pauseEclipses) {
+    appState.eclipseHoldUntil = 0;
+    hideYearEclipseStatus();
+  }
+});
 
 ui.play.addEventListener('click', () => {
   appState.isPlaying = !appState.isPlaying;
@@ -1807,16 +1896,51 @@ function animate(now) {
     advanceEclipseMode(deltaSeconds);
     updateScene();
   } else if (appState.isPlaying && !appState.useRealTime) {
-    // Mois : 0,15 j/s (cycle lunaire). Année : 10 j/s pour rendre la
-    // révolution complète observable en ~36 s.
-    const daysPerSecond = appState.timeMode === 'year' ? 10 : 0.15;
-    const timeMax = getTimeMax();
-    appState.timeDays += deltaSeconds * daysPerSecond;
-    if (appState.timeDays > timeMax) {
-      appState.timeDays -= timeMax;
+    // Mois : 0,15 j/s (cycle lunaire). Année : vitesse réglable (1 à 30 j/s).
+    let daysPerSecond = appState.timeMode === 'year' ? appState.yearSpeed : 0.15;
+    let held = false;
+
+    if (appState.timeMode === 'year') {
+      refreshYearNextEclipse();
+      const next = appState.nextEclipse;
+      if (next && appState.pauseEclipses) {
+        const untilDays = (next.ms - currentDateMs()) / DAY_MS;
+        if (untilDays > 0 && untilDays <= 2) {
+          // Ralentissement dans les deux jours qui précèdent l'éclipse :
+          // on voit la Lune se rapprocher du nœud et l'ombre se former.
+          daysPerSecond = Math.min(daysPerSecond, 0.5);
+          showYearEclipseStatus(
+            `Alignement en cours — éclipse dans ${formatApproach(untilDays)}. Ralentissement pour observer.`
+          );
+        } else if (untilDays <= 0 && untilDays > -0.5 && appState.heldEclipsePeakMs !== next.ms) {
+          appState.heldEclipsePeakMs = next.ms;
+          appState.eclipseHoldUntil = performance.now() + 3000;
+          showYearEclipseStatus('Alignement Soleil–Terre–Lune — pause de 3 s pour observer l\'éclipse.');
+        } else if (!appState.eclipseHoldUntil && ui.eclipseCinematicStatus.dataset.yearStatus === '1') {
+          hideYearEclipseStatus();
+        }
+      }
+
+      if (appState.eclipseHoldUntil) {
+        if (performance.now() < appState.eclipseHoldUntil) {
+          held = true;
+        } else {
+          appState.eclipseHoldUntil = 0;
+          appState.nextEclipse = null;
+          hideYearEclipseStatus();
+        }
+      }
     }
-    ui.time.value = String(appState.timeDays);
-    ui.timeVal.textContent = formatTimeValue(appState.timeDays);
+
+    if (!held) {
+      const timeMax = getTimeMax();
+      appState.timeDays += deltaSeconds * daysPerSecond;
+      if (appState.timeDays > timeMax) {
+        appState.timeDays -= timeMax;
+      }
+      ui.time.value = String(appState.timeDays);
+      ui.timeVal.textContent = formatTimeValue(appState.timeDays);
+    }
     updateScene();
   } else if (appState.useRealTime && now - lastRealTimeRefresh > 1000) {
     lastRealTimeRefresh = now;
@@ -1870,6 +1994,10 @@ function initialize() {
   ui.timeModeYear.classList.remove('active');
   ui.timeModeMonth.setAttribute('aria-pressed', 'true');
   ui.timeModeYear.setAttribute('aria-pressed', 'false');
+  ui.yearOptions.style.display = 'none';
+  ui.yearSpeed.value = String(appState.yearSpeed);
+  ui.yearSpeedVal.textContent = String(appState.yearSpeed);
+  ui.pauseEclipses.checked = appState.pauseEclipses;
   ui.timeOffset.value = '0';
   ui.timeOffsetVal.textContent = '0.0';
   ui.nextEclipse.textContent = 'Recherche…';
@@ -1917,6 +2045,14 @@ function initialize() {
         earthOrbitPoints: earthOrbitLine.geometry.attributes.position.count,
         moonOrbitInclinationDeg: moonOrbitTilt.rotation.x * RAD2DEG,
         eclipseEffectVisible: eclipseEffects.visible
+      }),
+      getYearMode: () => ({
+        speed: appState.yearSpeed,
+        pause: appState.pauseEclipses,
+        nextEclipse: appState.nextEclipse ? appState.nextEclipse.ms : null,
+        hold: appState.eclipseHoldUntil > performance.now(),
+        autoEclipseStrength: appState.autoEclipseStrength,
+        yearOptionsVisible: ui.yearOptions.style.display !== 'none'
       }),
       getEclipseMode: () => ({
         active: eclipseMode.active,
