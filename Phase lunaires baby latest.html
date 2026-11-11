@@ -107,6 +107,8 @@
     .time-mode button.active { background: #2266aa; border-color: #44aaff; }
     .checkbox-label { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 4px; }
     .checkbox-label input { width: auto; margin: 0; }
+    #orbitConditions { color: #9cc4e8; }
+    #orbitConditions.near-node { color: #ffcc66; font-weight: 600; }
 
     /* ---- PANNEAU OPTIONS AVANCÉES ---- */
     #advancedPanel { width: 220px; top: 350px; left: 10px; max-height: calc(100vh - 390px); }
@@ -204,6 +206,8 @@
     <div class="control-group">
       <label>Mode éclipse (précession des nœuds)</label>
       <button id="btnAnimateEclipse">Mode Éclipse</button>
+      <button id="btnFocusEclipse" style="margin-top:6px;">Cadrer l'éclipse (caméra manuelle)</button>
+      <div id="orbitConditions" class="hint">Nœud Ω = — · latitude β = — · inclinaison 5,145°</div>
       <div id="eclipseCinematicStatus" class="hint" style="display:none;">—</div>
     </div>
 
@@ -854,6 +858,56 @@ const orbitLine = new THREE.Line(
 );
 moonOrbitTilt.add(orbitLine);
 
+// Référence du plan écliptique local (cercle non incliné autour de la Terre).
+// Comparé à l'orbite lunaire inclinée, il rend les 5,145° observables.
+const eclipticReferencePoints = [];
+for (let i = 0; i <= 128; i++) {
+  const angle = (i / 128) * TAU;
+  eclipticReferencePoints.push(new THREE.Vector3(
+    Math.cos(angle) * SCENE.MOON_ORBIT,
+    0,
+    -Math.sin(angle) * SCENE.MOON_ORBIT
+  ));
+}
+const eclipticReference = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints(eclipticReferencePoints),
+  new THREE.LineBasicMaterial({ color: 0x335577, transparent: true, opacity: 0.4 })
+);
+moonOrbitGroup.add(eclipticReference);
+
+// Ligne des nœuds (intersection orbite lunaire / écliptique) et marqueurs.
+const nodeLine = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+  new THREE.LineBasicMaterial({ color: 0x66aaff, transparent: true, opacity: 0.9 })
+);
+scene.add(nodeLine);
+const nodeMarkerA = new THREE.Mesh(
+  new THREE.SphereGeometry(0.045, 10, 10),
+  new THREE.MeshBasicMaterial({ color: 0x66aaff })
+);
+const nodeMarkerB = new THREE.Mesh(
+  new THREE.SphereGeometry(0.045, 10, 10),
+  new THREE.MeshBasicMaterial({ color: 0x66aaff })
+);
+scene.add(nodeMarkerA, nodeMarkerB);
+
+// Ligne de latitude : hauteur de la Lune au-dessus/au-dessous de l'écliptique.
+const moonLatitudeLine = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+  new THREE.LineBasicMaterial({ color: 0xffaa44, transparent: true, opacity: 0.8 })
+);
+scene.add(moonLatitudeLine);
+
+// Ligne d'alignement Soleil–Terre–Lune, visible à l'approche de l'éclipse.
+const alignmentGuide = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+  new THREE.LineBasicMaterial({ color: 0xffcc66, transparent: true, opacity: 0 })
+);
+scene.add(alignmentGuide);
+nodeLine.frustumCulled = false;
+moonLatitudeLine.frustumCulled = false;
+alignmentGuide.frustumCulled = false;
+
 // ==========================================
 // 2bis. ORBITE ANNUELLE DE LA TERRE + EFFETS D'ÉCLIPSE
 // ==========================================
@@ -988,6 +1042,8 @@ const ui = {
   skyDate: document.getElementById('skyDate'),
   season: document.getElementById('season'),
   btnAnimateEclipse: document.getElementById('btnAnimateEclipse'),
+  btnFocusEclipse: document.getElementById('btnFocusEclipse'),
+  orbitConditions: document.getElementById('orbitConditions'),
   eclipseCinematicStatus: document.getElementById('eclipseCinematicStatus'),
   hud: document.getElementById('hud')
 };
@@ -1127,6 +1183,14 @@ function updateHud(sky, dateMs) {
   ui.eclipse.classList.toggle('active', Boolean(sky.eclipse));
   ui.skyDate.textContent = `Date : ${formatDate(dateMs)}`;
   ui.season.textContent = `Saison (N) : ${getNorthernSeason(sky.sun.lambdaDeg)}`;
+
+  // Conditions orbitales en clair : longitude du nœud, latitude lunaire et
+  // écart Soleil–Lune. Elles deviennent dorées quand la Lune est près du nœud.
+  const betaDeg = appState.visualBetaDeg;
+  ui.orbitConditions.textContent =
+    `Nœud Ω = ${appState.visualNodeDeg.toFixed(1)}° · β = ${betaDeg.toFixed(1)}° · `
+    + `écart Soleil–Lune = ${sky.separationDeg.toFixed(1)}° · inclinaison 5,145°`;
+  ui.orbitConditions.classList.toggle('near-node', Math.abs(betaDeg) <= 1.5);
 }
 
 // ==========================================
@@ -1146,6 +1210,13 @@ function currentDateMs() {
   return appState.useRealTime
     ? Date.now() + appState.timeOffset * DAY_MS
     : appState.simEpochMs + appState.timeDays * DAY_MS;
+}
+
+function setLinePoints(line, from, to) {
+  const positions = line.geometry.attributes.position;
+  positions.setXYZ(0, from.x, from.y, from.z);
+  positions.setXYZ(1, to.x, to.y, to.z);
+  positions.needsUpdate = true;
 }
 
 function updateObserverPositions() {
@@ -1221,6 +1292,35 @@ function updateScene() {
   const isDayB = zenithB.dot(sunDirection) > 0;
   const aboveHorizonA = zenithA.dot(moonDirection) > 0.01;
   const aboveHorizonB = zenithB.dot(moonDirection) > 0.01;
+
+  // Conditions d'éclipse observables : ligne des nœuds, hauteur de la Lune
+  // au-dessus de l'écliptique et ligne Soleil–Terre–Lune à l'approche.
+  const nodeDirection = eclipticUnit(appState.visualNodeDeg, 0);
+  const nodeHalfLength = 3.4;
+  const nodeEndpointA = earthCenterWorld.clone().addScaledVector(nodeDirection, nodeHalfLength);
+  const nodeEndpointB = earthCenterWorld.clone().addScaledVector(nodeDirection, -nodeHalfLength);
+  setLinePoints(nodeLine, nodeEndpointA, nodeEndpointB);
+  nodeMarkerA.position.copy(nodeEndpointA);
+  nodeMarkerB.position.copy(nodeEndpointB);
+
+  const moonEclipticProjection = new THREE.Vector3(
+    moonWorldPosition.x,
+    earthCenterWorld.y,
+    moonWorldPosition.z
+  );
+  setLinePoints(moonLatitudeLine, moonWorldPosition, moonEclipticProjection);
+  moonLatitudeLine.material.opacity = 0.25
+    + 0.75 * clamp(Math.abs(appState.visualBetaDeg) / ASTRONOMY.MOON_INCLINATION_DEG, 0, 1);
+
+  let alignmentOpacity = 0;
+  if (eclipseMode.active) {
+    alignmentOpacity = 0.55;
+  } else if (appState.timeMode === 'year' && appState.nextEclipse) {
+    const untilDays = Math.abs(appState.nextEclipse.ms - dateMs) / DAY_MS;
+    if (untilDays < 2) alignmentOpacity = clamp(1 - untilDays / 2, 0.2, 0.9);
+  }
+  setLinePoints(alignmentGuide, new THREE.Vector3(0, 0, 0), moonWorldPosition);
+  alignmentGuide.material.opacity = alignmentOpacity;
 
   drawMoonPhase(ui.canvasA, ui.labelA, ui.statusA, sky, appState.latitudeA, aboveHorizonA, isDayA);
   drawMoonPhase(ui.canvasB, ui.labelB, ui.statusB, sky, -appState.latitudeA, aboveHorizonB, isDayB);
@@ -1383,6 +1483,24 @@ function advanceEclipseMode(deltaSeconds) {
     ui.eclipseCinematicStatus.textContent =
       `Nœud orbital atteint — β = ${Math.abs(appState.visualBetaDeg).toFixed(1)}° · ${formatEclipseShort(eclipseMode.eclipse)}. Zoomez pour observer l'ombre.`;
   }
+}
+
+// Action MANUELLE (bouton) : la caméra ne bouge jamais toute seule. Elle se
+// rapproche du couple Terre–Lune pour rendre l'ombre et les nœuds observables.
+function focusEclipseView() {
+  const earthPos = earthGroup.position;
+  const axis = earthPos.clone().normalize();
+  const side = new THREE.Vector3().crossVectors(axis, UP);
+  if (side.lengthSq() < 1e-8) side.set(1, 0, 0); else side.normalize();
+  const target = earthPos.clone();
+  const position = earthPos.clone()
+    .addScaledVector(side, 5.2)
+    .addScaledVector(UP, 3.2)
+    .addScaledVector(axis, -0.8);
+  controls.target.copy(target);
+  camera.position.copy(position);
+  controls.update();
+  updateScene();
 }
 
 function stopEclipseMode() {
@@ -1847,6 +1965,7 @@ ui.btnNextEclipse.addEventListener('click', () => {
 });
 
 ui.btnAnimateEclipse.addEventListener('click', startEclipseMode);
+ui.btnFocusEclipse.addEventListener('click', focusEclipseView);
 
 // ==========================================
 // 8. DIMENSIONNEMENT ET OBSERVATEURS DE TAILLE
@@ -1910,12 +2029,16 @@ function animate(now) {
           // on voit la Lune se rapprocher du nœud et l'ombre se former.
           daysPerSecond = Math.min(daysPerSecond, 0.5);
           showYearEclipseStatus(
-            `Alignement en cours — éclipse dans ${formatApproach(untilDays)}. Ralentissement pour observer.`
+            `Alignement en cours — éclipse dans ${formatApproach(untilDays)} · `
+            + `β = ${appState.visualBetaDeg.toFixed(1)}° · nœud Ω = ${appState.visualNodeDeg.toFixed(1)}°.`
           );
         } else if (untilDays <= 0 && untilDays > -0.5 && appState.heldEclipsePeakMs !== next.ms) {
           appState.heldEclipsePeakMs = next.ms;
-          appState.eclipseHoldUntil = performance.now() + 3000;
-          showYearEclipseStatus('Alignement Soleil–Terre–Lune — pause de 3 s pour observer l\'éclipse.');
+          appState.eclipseHoldUntil = performance.now() + 5000;
+          showYearEclipseStatus(
+            `Alignement Soleil–Terre–Lune — pause de 5 s · β = ${appState.visualBetaDeg.toFixed(1)}° · `
+            + `nœud Ω = ${appState.visualNodeDeg.toFixed(1)}°. Zoomez ou cliquez sur « Cadrer l'éclipse ».`
+          );
         } else if (!appState.eclipseHoldUntil && ui.eclipseCinematicStatus.dataset.yearStatus === '1') {
           hideYearEclipseStatus();
         }
@@ -2044,7 +2167,12 @@ function initialize() {
       getSceneInfo: () => ({
         earthOrbitPoints: earthOrbitLine.geometry.attributes.position.count,
         moonOrbitInclinationDeg: moonOrbitTilt.rotation.x * RAD2DEG,
-        eclipseEffectVisible: eclipseEffects.visible
+        eclipseEffectVisible: eclipseEffects.visible,
+        nodeLineVisible: nodeLine.visible,
+        latitudeLineLength: moonLatitudeLine.geometry.attributes.position.getY(1)
+          - moonLatitudeLine.geometry.attributes.position.getY(0),
+        alignmentGuideOpacity: alignmentGuide.material.opacity,
+        conditionsText: ui.orbitConditions.textContent
       }),
       getYearMode: () => ({
         speed: appState.yearSpeed,
