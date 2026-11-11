@@ -99,14 +99,20 @@
     #controls .content { padding: 12px; flex: 1; overflow-y: auto; min-height: 0; }
     #controls label { display: block; margin-bottom: 8px; }
     #controls input[type=range] { width: 100%; vertical-align: middle; margin-top: 4px; }
+    #controls .hint { margin: 0 0 8px; }
+
+    /* ---- SÉLECTEUR MOIS / ANNÉE ---- */
+    .time-mode { display: flex; gap: 6px; margin: 2px 0 6px; }
+    .time-mode button { flex: 1; padding: 5px 6px; font-size: 11px; }
+    .time-mode button.active { background: #2266aa; border-color: #44aaff; }
 
     /* ---- PANNEAU OPTIONS AVANCÉES ---- */
-    #advancedPanel { width: 220px; top: 232px; left: 10px; }
+    #advancedPanel { width: 220px; top: 300px; left: 10px; max-height: calc(100vh - 340px); }
     #advancedPanel .content { padding: 12px; flex: 1; overflow-y: auto; min-height: 0; }
 
     /* Écrans peu hauts (téléphones en paysage) : garder la poignée visible. */
-    @media (min-width: 721px) and (max-height: 560px) {
-      #advancedPanel { max-height: calc(100vh - 242px); }
+    @media (min-width: 721px) and (max-height: 720px) {
+      #advancedPanel { max-height: calc(100vh - 360px); }
     }
 
     .control-group { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px dashed #333; }
@@ -168,6 +174,11 @@
   <div class="panel-header">Contrôles Manuels</div>
   <div class="content">
     <label>Latitude (A) : <input type="range" id="lat" min="-90" max="90" value="5" step="1"> <span id="latVal">5°N</span></label>
+    <div class="time-mode" role="group" aria-label="Échelle de temps">
+      <button id="timeModeMonth" type="button" class="active" aria-pressed="true">Mois</button>
+      <button id="timeModeYear" type="button" aria-pressed="false">Année</button>
+    </div>
+    <div class="hint">Mois : 29,5 j · Année : 365,24 j (révolution complète)</div>
     <label>Temps (jours) : <input type="range" id="time" min="0" max="29.53" value="0" step="0.01"> <span id="timeVal">0.00</span></label>
     <button id="play" style="width:100%">▶ Animer</button>
   </div>
@@ -308,6 +319,7 @@ const DAY_MS = 86400000;
 const ASTRONOMY = Object.freeze({
   J2000_MS: Date.UTC(2000, 0, 1, 12, 0, 0),
   SYNODIC_MONTH_DAYS: 29.530588861,
+  TROPICAL_YEAR_DAYS: 365.2422,
   EARTH_RADIUS_KM: 6371.0,
   MOON_RADIUS_KM: 1737.4,
   SUN_RADIUS_KM: 695700,
@@ -901,6 +913,7 @@ const appState = {
   isPlaying: false,
   useRealTime: false,
   timeOffset: 0,
+  timeMode: 'month', // 'month' (cycle lunaire) ou 'year' (révolution complète)
   simEpochMs: ASTRONOMY.NEW_MOON_EPOCH_MS,
   sky: null,
   visualNodeDeg: 0,
@@ -938,6 +951,8 @@ const ui = {
   latVal: document.getElementById('latVal'),
   time: document.getElementById('time'),
   timeVal: document.getElementById('timeVal'),
+  timeModeMonth: document.getElementById('timeModeMonth'),
+  timeModeYear: document.getElementById('timeModeYear'),
   play: document.getElementById('play'),
   btnTextures: document.getElementById('btnTextures'),
   citySelect: document.getElementById('citySelect'),
@@ -1316,13 +1331,13 @@ function startEclipseMode() {
   // retrouve cet instant à la sortie du mode.
   const phaseDays = (found.state.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
   appState.simEpochMs = found.ms - phaseDays * DAY_MS;
-  appState.timeDays = phaseDays;
-  ui.time.value = String(phaseDays);
-  ui.timeVal.textContent = phaseDays.toFixed(2);
+  setTimeDays(phaseDays);
   ui.time.disabled = true;
   ui.play.disabled = true;
   ui.btnSyncTime.disabled = true;
   ui.btnNextEclipse.disabled = true;
+  ui.timeModeMonth.disabled = true;
+  ui.timeModeYear.disabled = true;
   ui.btnAnimateEclipse.textContent = 'Quitter le mode éclipse';
   ui.btnAnimateEclipse.classList.add('active');
   ui.eclipseCinematicStatus.style.display = 'block';
@@ -1357,6 +1372,8 @@ function stopEclipseMode() {
   ui.play.disabled = false;
   ui.btnSyncTime.disabled = false;
   ui.btnNextEclipse.disabled = false;
+  ui.timeModeMonth.disabled = false;
+  ui.timeModeYear.disabled = false;
   ui.btnAnimateEclipse.textContent = 'Mode Éclipse';
   ui.btnAnimateEclipse.classList.remove('active');
   ui.eclipseCinematicStatus.style.display = 'block';
@@ -1423,7 +1440,7 @@ function layoutPanelsForSmallScreens() {
 
   setPanelRect(ui.panelB, gap, gap, phaseWidth, phaseHeight);
   setPanelRect(ui.panelA, viewportWidth - phaseWidth - gap, gap, phaseWidth, phaseHeight);
-  setPanelRect(ui.controls, gap, lowerTop, columnWidth, Math.min(lowerHeight, 230));
+  setPanelRect(ui.controls, gap, lowerTop, columnWidth, Math.min(lowerHeight, 270));
   setPanelRect(ui.advancedPanel, viewportWidth - columnWidth - gap, lowerTop, columnWidth, Math.min(lowerHeight, 360));
 }
 
@@ -1570,10 +1587,40 @@ function setLatitude(latitude) {
   ui.latVal.textContent = formatLatitudeShort(appState.latitudeA);
 }
 
+function getTimeMax() {
+  return appState.timeMode === 'year'
+    ? ASTRONOMY.TROPICAL_YEAR_DAYS
+    : ASTRONOMY.SYNODIC_MONTH_DAYS;
+}
+
+function formatTimeValue(days) {
+  return days.toFixed(appState.timeMode === 'year' ? 1 : 2);
+}
+
 function setTimeDays(days) {
-  appState.timeDays = clamp(days, 0, ASTRONOMY.SYNODIC_MONTH_DAYS);
+  appState.timeDays = clamp(days, 0, getTimeMax());
   ui.time.value = String(appState.timeDays);
-  ui.timeVal.textContent = appState.timeDays.toFixed(2);
+  ui.timeVal.textContent = formatTimeValue(appState.timeDays);
+}
+
+// Bascule entre le cycle lunaire (29,53 j) et l'année complète (365,2422 j).
+// Le mode Année permet de voir la Terre parcourir toute son orbite.
+function setTimeMode(mode) {
+  if (mode !== 'month' && mode !== 'year') return;
+  appState.timeMode = mode;
+  const max = getTimeMax();
+  appState.timeDays = clamp(appState.timeDays, 0, max);
+  ui.time.min = '0';
+  ui.time.max = String(max);
+  ui.time.step = mode === 'year' ? '0.1' : '0.01';
+  ui.time.value = String(appState.timeDays);
+  ui.timeVal.textContent = formatTimeValue(appState.timeDays);
+  ui.timeModeMonth.classList.toggle('active', mode === 'month');
+  ui.timeModeYear.classList.toggle('active', mode === 'year');
+  ui.timeModeMonth.setAttribute('aria-pressed', String(mode === 'month'));
+  ui.timeModeYear.setAttribute('aria-pressed', String(mode === 'year'));
+  updateNextEclipseHint();
+  updateScene();
 }
 
 function setRealTime(enabled) {
@@ -1583,6 +1630,8 @@ function setRealTime(enabled) {
   ui.offsetContainer.style.display = enabled ? 'block' : 'none';
   ui.time.disabled = enabled;
   ui.play.disabled = enabled;
+  ui.timeModeMonth.disabled = enabled;
+  ui.timeModeYear.disabled = enabled;
   updateNextEclipseHint();
   updateScene();
 }
@@ -1623,6 +1672,9 @@ ui.time.addEventListener('input', (event) => {
 });
 
 ui.time.addEventListener('change', updateNextEclipseHint);
+
+ui.timeModeMonth.addEventListener('click', () => setTimeMode('month'));
+ui.timeModeYear.addEventListener('click', () => setTimeMode('year'));
 
 ui.play.addEventListener('click', () => {
   appState.isPlaying = !appState.isPlaying;
@@ -1696,7 +1748,7 @@ ui.btnNextEclipse.addEventListener('click', () => {
     if (appState.useRealTime) setRealTime(false);
 
     // On recale l'époque de simulation pour que le curseur affiche l'instant
-    // exact de l'éclipse sans changer la plage 0–29,53 jours.
+    // exact de l'éclipse dans la plage de temps courante (mois ou année).
     const phaseDays = (found.state.elongationDeg / 360) * ASTRONOMY.SYNODIC_MONTH_DAYS;
     appState.simEpochMs = found.ms - phaseDays * DAY_MS;
     setTimeDays(phaseDays);
@@ -1755,12 +1807,16 @@ function animate(now) {
     advanceEclipseMode(deltaSeconds);
     updateScene();
   } else if (appState.isPlaying && !appState.useRealTime) {
-    appState.timeDays += deltaSeconds * 0.15;
-    if (appState.timeDays > ASTRONOMY.SYNODIC_MONTH_DAYS) {
-      appState.timeDays -= ASTRONOMY.SYNODIC_MONTH_DAYS;
+    // Mois : 0,15 j/s (cycle lunaire). Année : 10 j/s pour rendre la
+    // révolution complète observable en ~36 s.
+    const daysPerSecond = appState.timeMode === 'year' ? 10 : 0.15;
+    const timeMax = getTimeMax();
+    appState.timeDays += deltaSeconds * daysPerSecond;
+    if (appState.timeDays > timeMax) {
+      appState.timeDays -= timeMax;
     }
     ui.time.value = String(appState.timeDays);
-    ui.timeVal.textContent = appState.timeDays.toFixed(2);
+    ui.timeVal.textContent = formatTimeValue(appState.timeDays);
     updateScene();
   } else if (appState.useRealTime && now - lastRealTimeRefresh > 1000) {
     lastRealTimeRefresh = now;
@@ -1805,10 +1861,15 @@ function startAuthorCreditAnimation() {
 function initialize() {
   ui.time.min = '0';
   ui.time.max = String(ASTRONOMY.SYNODIC_MONTH_DAYS);
+  ui.time.step = '0.01';
   ui.time.value = '0';
   ui.lat.value = String(appState.latitudeA);
   ui.latVal.textContent = formatLatitudeShort(appState.latitudeA);
-  ui.timeVal.textContent = appState.timeDays.toFixed(2);
+  ui.timeVal.textContent = formatTimeValue(appState.timeDays);
+  ui.timeModeMonth.classList.add('active');
+  ui.timeModeYear.classList.remove('active');
+  ui.timeModeMonth.setAttribute('aria-pressed', 'true');
+  ui.timeModeYear.setAttribute('aria-pressed', 'false');
   ui.timeOffset.value = '0';
   ui.timeOffsetVal.textContent = '0.0';
   ui.nextEclipse.textContent = 'Recherche…';
